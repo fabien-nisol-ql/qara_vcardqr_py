@@ -33,7 +33,7 @@ install-os: build
 
 
 run: install
-	# Usage: make run ARGS="--yaml examples/contact.yaml --out out.png"
+	# Usage: make run ARGS="--yaml examples/team.yaml --out out.png"
 	$(VENV)/bin/vcardqr $(ARGS)
 
 run_example: install

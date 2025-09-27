@@ -1,0 +1,39 @@
+# team.yaml
+defaults:
+  qr:
+    # Paths are resolved relative to THIS YAML file
+    logo: logo.png
+    out_pattern: "../build/out/{vcard.given_name}.{vcard.family_name}-{qr.size_px}px.png"
+    size_px: 512
+    # You can also set: box_size, border, logo_scale, badge_rounding, badge_padding, size_cm, dpi
+  vcard:
+    org: QARALink SA
+    tels:
+      work: "+41 44 987 65 43"
+    adr:
+      street: Bahnhofstrasse 1
+      locality: Zürich
+      region: ZH
+      postal_code: "8001"
+      country: Switzerland
+    url: https://qaralink.dev
+    note: "Let’s talk AI & MedTech"
+persons:
+  - vcard:
+      given_name: John
+      family_name: Doe
+      fn: John Doe
+      title: QRcode Manager
+      emails:
+        - jdoel@qaralink.com
+      tels:
+        cell: "+41 79 123 45 67"
+  - vcard:
+      given_name: Tom
+      family_name: Cruise
+      fn: Tom Cruise
+      title: Chief Pilot
+      emails:
+        - tcruise@qaralink.com
+      tels:
+        cell: "+41 79 123 45 67"

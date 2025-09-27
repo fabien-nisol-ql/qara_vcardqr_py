@@ -7,24 +7,10 @@ from typing import Dict, Any, List, Optional, NoReturn
 
 import yaml
 
-from .vcard import build_vcard
-from .qr import generate_qr_with_logo
-from .decode import decode_qr_from_file
+# We keep heavy imports (opencv, PIL, qrcode) out of module scope for faster startup.
 
 
-def parse_kv_pairs(pairs: list[str]) -> Dict[str, str]:
-    """
-    Parse KEY:VALUE pairs from CLI (e.g., --tel cell:"+41 ..." --adr street:"...").
-    """
-    out: Dict[str, str] = {}
-    for p in pairs or []:
-        if ":" not in p:
-            raise argparse.ArgumentTypeError(f"Expected KEY:VALUE, got '{p}'")
-        k, v = p.split(":", 1)
-        k = k.strip()
-        out[k] = v.strip()
-    return out
-
+# ---------- Utilities ----------
 
 def load_yaml(path: str) -> Dict[str, Any]:
     try:
@@ -37,6 +23,17 @@ def load_yaml(path: str) -> Dict[str, Any]:
         raise SystemExit(f"Error: YAML file not found: {path}")
     except yaml.YAMLError as e:
         raise SystemExit(f"Error: Failed to parse YAML '{path}': {e}")
+
+
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge dicts: override takes precedence."""
+    out: Dict[str, Any] = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 
 def _coalesce(*vals):
@@ -65,7 +62,44 @@ def _sanitize_filename(name: str) -> str:
     return name or "output"
 
 
+def _deep_get(root: Any, path: str) -> Any:
+    """Resolve dotted path like 'vcard.given_name' or 'qr.size_px' against nested dicts."""
+    cur = root
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return ""
+    return cur if isinstance(cur, (str, int, float, bool)) else ""
+
+
+def _render_pattern_with_yaml(pattern: str, yaml_root: Dict[str, Any], vcard_aliases: Dict[str, Any]) -> str:
+    """
+    Render out_pattern allowing dotted YAML paths and friendly/flat aliases.
+    Aliases live in vcard_aliases (firstName/lastName/given_name/…).
+    """
+    placeholder_rx = re.compile(r"\{([^{}]+)\}")
+
+    def repl(m: re.Match) -> str:
+        key = m.group(1).strip()
+        # dotted lookup first
+        if "." in key:
+            val = _deep_get(yaml_root, key)
+            if val != "":
+                return str(val)
+        # alias lookup
+        if key in vcard_aliases:
+            return str(vcard_aliases[key])
+        # top-level scalar last
+        if isinstance(yaml_root.get(key, None), (str, int, float, bool)):
+            return str(yaml_root[key])
+        return ""
+
+    return placeholder_rx.sub(repl, pattern)
+
+
 def _build_vcard_alias_context(vcard_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Friendly aliases for vcard fields (firstName/lastName/etc.)."""
     given = vcard_inputs.get("given_name") or ""
     family = vcard_inputs.get("family_name") or ""
     adr = vcard_inputs.get("adr") or {}
@@ -86,6 +120,7 @@ def _build_vcard_alias_context(vcard_inputs: Dict[str, Any]) -> Dict[str, Any]:
         "email": primary_email,
         "url": vcard_inputs.get("url") or "",
         "note": vcard_inputs.get("note") or "",
+        # address
         "po_box": adr.get("po_box", ""),
         "extended": adr.get("extended", ""),
         "street": adr.get("street", ""),
@@ -93,10 +128,13 @@ def _build_vcard_alias_context(vcard_inputs: Dict[str, Any]) -> Dict[str, Any]:
         "region": adr.get("region", ""),
         "postal_code": adr.get("postal_code", ""),
         "country": adr.get("country", ""),
+        # phones
         "cell": tels.get("cell", ""),
         "work": tels.get("work", ""),
         "home": tels.get("home", ""),
     }
+
+    # friendly aliases
     ctx.update({
         "firstName": given,
         "lastName": family,
@@ -112,50 +150,20 @@ def _build_vcard_alias_context(vcard_inputs: Dict[str, Any]) -> Dict[str, Any]:
     return ctx
 
 
-def _deep_get(root: Any, path: str) -> Any:
-    cur = root
-    for part in path.split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return ""
-    return cur if isinstance(cur, (str, int, float, bool)) else ""
-
-
-_placeholder_rx = re.compile(r"\{([^{}]+)\}")
-
-
-def _render_pattern_with_yaml(pattern: str, yaml_root: Dict[str, Any], vcard_aliases: Dict[str, Any]) -> str:
-    """
-    Render out_pattern allowing dotted YAML paths and friendly/flat aliases.
-    """
-    def repl(m: re.Match) -> str:
-        key = m.group(1).strip()
-        if "." in key:
-            val = _deep_get(yaml_root, key)
-            if val != "":
-                return str(val)
-        if key in vcard_aliases:
-            return str(vcard_aliases[key])
-        if isinstance(yaml_root.get(key, None), (str, int, float, bool)):
-            return str(yaml_root[key])
-        return ""
-    return _placeholder_rx.sub(repl, pattern)
-
-
 def _resolve_output_path(
         explicit_out: Optional[str],
         out_pattern: Optional[str],
         vcard_ctx_flat: Dict[str, Any],
         yaml_root: Dict[str, Any],
-        base_dir: Optional[str],  # ← base directory (YAML dir) to resolve relative paths
+        base_dir: Optional[str],
 ) -> str:
     """
     Decide output path:
-      - If explicit_out is provided -> use it (resolve relative to base_dir if present).
-      - Else if out_pattern is provided -> render then resolve relative to base_dir.
+      - If explicit_out is provided -> use it.
+      - Else if out_pattern is provided -> render it.
       - Else -> error.
     Adds '.png' if no extension is present. Sanitizes only the basename.
+    Resolve relative paths against `base_dir` (the YAML file's directory), unless piping to /dev/*.
     """
     if explicit_out:
         path = explicit_out
@@ -167,9 +175,9 @@ def _resolve_output_path(
             base += ".png"
         path = os.path.join(dir_part or ".", base)
     else:
-        fail("Missing output destination. Provide --out or --out-pattern, or set qr.out / qr.out_pattern in YAML.")
+        fail("Missing output destination. Provide qr.out or qr.out_pattern in YAML, or pass --out/--out-pattern.")
 
-    # Resolve relative paths against YAML directory if provided
+    # Resolve relative paths against YAML directory (unless piping)
     if base_dir and not os.path.isabs(path) and not path.startswith("/dev/"):
         path = os.path.normpath(os.path.join(base_dir, path))
 
@@ -180,47 +188,21 @@ def _resolve_output_path(
     return path
 
 
+# ---------- Main ----------
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Generate a vCard (RFC6350) QR code with an optional centered logo, or parse a QR image."
+        description="Generate vCard (RFC6350) QR code(s) from YAML, or parse a QR image."
     )
 
     # Mutually exclusive action: parse vs generate (default)
     act = ap.add_mutually_exclusive_group()
     act.add_argument("--parse", metavar="FILE", help="Parse QR from image FILE and print payload(s) to stdout.")
 
-    # YAML config (for generate mode)
-    ap.add_argument("--yaml", dest="yaml_file", help="YAML file with vCard + QR config")
-
-    # vCard fields (generate mode)
-    ap.add_argument("--given-name")
-    ap.add_argument("--family-name")
-    ap.add_argument("--fn")
-    ap.add_argument("--additional-names")
-    ap.add_argument("--honorific-prefixes")
-    ap.add_argument("--honorific-suffixes")
-    ap.add_argument("--org")
-    ap.add_argument("--title")
-    ap.add_argument("--email", action="append")
-    ap.add_argument("--tel", action="append", default=[])
-    ap.add_argument("--adr", action="append", default=[])
-    ap.add_argument("--url")
-    ap.add_argument("--note")
-
-    # QR / output (generate mode)
-    ap.add_argument("--logo")
-    ap.add_argument("--out")
-    ap.add_argument("--out-pattern")
-    ap.add_argument("--box-size", type=int)
-    ap.add_argument("--border", type=int)
-    ap.add_argument("--logo-scale", type=float)
-    ap.add_argument("--badge-rounding", type=int)
-    ap.add_argument("--badge-padding", type=int)
-    ap.add_argument("--size-cm", type=float)
-    ap.add_argument("--size-px", type=int)
-    ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--no-create-dirs", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
+    # YAML file (generate mode). Supports:
+    #  - Single-person YAML with top-level 'vcard' + 'qr'
+    #  - Batch YAML with 'defaults' + 'persons'
+    ap.add_argument("--yaml", dest="yaml_file", help="YAML file. Supports either single-person or defaults+persons.")
 
     # Show help if no args
     if len(sys.argv) == 1:
@@ -232,157 +214,160 @@ def main() -> None:
     # -------------------------
     # PARSE MODE
     # -------------------------
-    # -------------------------
-    # PARSE MODE
-    # -------------------------
     if args.parse:
-        # UX: warn about heavy import
+        # UX: warn heavy import (first time can be slow)
         print("⏳ Loading OpenCV (first time can take a while)...", file=sys.stderr, flush=True)
         try:
-            from .decode import decode_qr_from_file  # lazy import
+            # Lazy import to avoid cv2 at startup
+            from .decode import decode_qr_from_file  # type: ignore
             payloads = decode_qr_from_file(args.parse)
         except FileNotFoundError:
             fail(f"Image not found: {args.parse}")
+        except ImportError as e:
+            # decode.py will raise an informative message about installing the extra
+            fail(str(e))
         except Exception as e:
             fail(f"Failed to decode QR from '{args.parse}': {e}")
+
         if not payloads:
             print("No QR codes found.", file=sys.stderr)
             sys.exit(3)
+
         for p in payloads:
-            print(p)
+            print(p)  # stdout only payloads
         print(f"✅ Parsed {len(payloads)} QR payload(s) from {args.parse}", file=sys.stderr)
         return
 
     # -------------------------
     # GENERATE MODE
     # -------------------------
+    if not args.yaml_file:
+        fail("Missing --yaml. Provide a YAML file (single-person or defaults+persons).")
 
-    # Load YAML if provided
-    y: Dict[str, Any] = {}
-    yaml_dir: Optional[str] = None
-    if args.yaml_file:
-        y = load_yaml(args.yaml_file)
-        yaml_dir = os.path.dirname(os.path.abspath(args.yaml_file))
+    # Lazy import generate-only stuff
+    from .vcard import build_vcard  # type: ignore
+    from .qr import generate_qr_with_logo  # type: ignore
 
-    y_v: Dict[str, Any] = y.get("vcard") or {}
-    y_qr: Dict[str, Any] = y.get("qr") or {}
+    # Load YAML
+    root_yaml = load_yaml(args.yaml_file)
+    yaml_dir = os.path.dirname(os.path.abspath(args.yaml_file))
 
-    given_name = _coalesce(args.given_name, y_v.get("given_name"))
-    family_name = _coalesce(args.family_name, y_v.get("family_name"))
-    fn = _coalesce(args.fn, y_v.get("fn"))
-    additional_names = _coalesce(args.additional_names, y_v.get("additional_names"))
-    honorific_prefixes = _coalesce(args.honorific_prefixes, y_v.get("honorific_prefixes"))
-    honorific_suffixes = _coalesce(args.honorific_suffixes, y_v.get("honorific_suffixes"))
-    org = _coalesce(args.org, y_v.get("org"))
-    title = _coalesce(args.title, y_v.get("title"))
-    emails: Optional[List[str]] = _coalesce(args.email, y_v.get("emails"))
+    persons: List[Dict[str, Any]] = []
+    defaults = root_yaml.get("defaults")
 
-    cli_tels = parse_kv_pairs(args.tel)
-    yaml_tels = y_v.get("tels") or {}
-    if not isinstance(yaml_tels, dict):
-        fail("YAML key 'tels' must be a mapping/dict.")
-    tels = {**yaml_tels, **cli_tels} or None
+    if "persons" in root_yaml:
+        # Batch mode: defaults + persons
+        if defaults and not isinstance(defaults, dict):
+            fail("'defaults' must be a mapping/object.")
+        defaults = defaults or {}
+        persons_raw = root_yaml.get("persons") or []
+        if not isinstance(persons_raw, list) or not persons_raw:
+            fail("'persons' must be a non-empty list.")
+        for entry in persons_raw:
+            if not isinstance(entry, dict):
+                fail("Each item in 'persons' must be a mapping/object.")
+            persons.append(deep_merge(defaults, entry))
+    elif "vcard" in root_yaml or "qr" in root_yaml:
+        # Single-person YAML
+        persons = [root_yaml]
+    else:
+        fail("YAML must define either top-level 'vcard'/'qr' or 'defaults' + 'persons'.")
 
-    cli_adr = parse_kv_pairs(args.adr)
-    yaml_adr = y_v.get("adr") or {}
-    if not isinstance(yaml_adr, dict):
-        fail("YAML key 'adr' must be a mapping/dict.")
-    adr = {**yaml_adr, **cli_adr} or None
+    # Generate for each person
+    for idx, merged in enumerate(persons, start=1):
+        v = merged.get("vcard") or {}
+        q = merged.get("qr") or {}
 
-    url = _coalesce(args.url, y_v.get("url"))
-    note = _coalesce(args.note, y_v.get("note"))
+        given_name = v.get("given_name")
+        family_name = v.get("family_name")
+        if not given_name or not family_name:
+            fail(f"Person {idx} missing required fields 'given_name'/'family_name'.")
 
-    vcard_input_map: Dict[str, Any] = {
-        "given_name": given_name,
-        "family_name": family_name,
-        "additional_names": additional_names,
-        "honorific_prefixes": honorific_prefixes,
-        "honorific_suffixes": honorific_suffixes,
-        "formatted_name": fn,
-        "fn": fn,
-        "org": org,
-        "title": title,
-        "emails": emails,
-        "tels": tels or {},
-        "adr": adr or {},
-        "url": url,
-        "note": note,
-    }
-    vcard_aliases = _build_vcard_alias_context(vcard_input_map)
+        # Build vCard payload
+        try:
+            vcard = build_vcard(
+                given_name=given_name,
+                family_name=family_name,
+                additional_names=v.get("additional_names"),
+                honorific_prefixes=v.get("honorific_prefixes"),
+                honorific_suffixes=v.get("honorific_suffixes"),
+                formatted_name=v.get("fn"),
+                org=v.get("org"),
+                title=v.get("title"),
+                emails=v.get("emails"),
+                tels=v.get("tels"),
+                adr=v.get("adr"),
+                url=v.get("url"),
+                note=v.get("note"),
+            )
+        except Exception as e:
+            fail(f"Failed to build vCard for person {idx}: {e}")
 
-    out_path = _resolve_output_path(
-        explicit_out=_coalesce(args.out, y_qr.get("out")),
-        out_pattern=_coalesce(args.out_pattern, y_qr.get("out_pattern")),
-        vcard_ctx_flat=vcard_aliases,
-        yaml_root={"vcard": y_v, "qr": y_qr, **y},
-        base_dir=yaml_dir,  # ← resolve relative to YAML dir
-    )
+        # Build alias context for patterns
+        vcard_input_map: Dict[str, Any] = {
+            "given_name": given_name,
+            "family_name": family_name,
+            "additional_names": v.get("additional_names"),
+            "honorific_prefixes": v.get("honorific_prefixes"),
+            "honorific_suffixes": v.get("honorific_suffixes"),
+            "formatted_name": v.get("fn"),
+            "fn": v.get("fn"),
+            "org": v.get("org"),
+            "title": v.get("title"),
+            "emails": v.get("emails"),
+            "tels": v.get("tels") or {},
+            "adr": v.get("adr") or {},
+            "url": v.get("url"),
+            "note": v.get("note"),
+        }
+        v_alias = _build_vcard_alias_context(vcard_input_map)
 
-    out_dir = os.path.dirname(os.path.abspath(out_path))
-    if out_dir and not args.no_create_dirs:
-        os.makedirs(out_dir, exist_ok=True)
+        # Resolve output path (out wins over out_pattern)
+        out_path = _resolve_output_path(
+            explicit_out=q.get("out"),
+            out_pattern=q.get("out_pattern"),
+            vcard_ctx_flat=v_alias,
+            yaml_root=merged,  # allow {vcard.*}, {qr.*}, or other keys
+            base_dir=yaml_dir,
+        )
 
-    # Resolve logo: if relative and YAML provided, make it relative to YAML dir
-    logo = _coalesce(args.logo, y_qr.get("logo"))
-    if logo:
-        if yaml_dir and not os.path.isabs(logo):
+        # Ensure directory
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as e:
+                fail(f"Cannot create output directory '{out_dir}': {e}")
+
+        # Resolve logo relative to YAML
+        logo = q.get("logo")
+        if logo and not os.path.isabs(logo):
             logo = os.path.normpath(os.path.join(yaml_dir, logo))
-        if not os.path.isfile(logo):
+        if logo and not os.path.isfile(logo):
             print(f"Warning: logo file not found: {logo} — continuing without logo.", file=sys.stderr)
             logo = None
 
-    box_size = int(_coalesce(args.box_size, y_qr.get("box_size", 12)))
-    border = int(_coalesce(args.border, y_qr.get("border", 4)))
-    logo_scale = float(_coalesce(args.logo_scale, y_qr.get("logo_scale", 0.22)))
-    badge_rounding = int(_coalesce(args.badge_rounding, y_qr.get("badge_rounding", 16)))
-    badge_padding = int(_coalesce(args.badge_padding, y_qr.get("badge_padding", 12)))
-
-    size_px = _coalesce(args.size_px, y_qr.get("size_px"))
-    size_cm = float(_coalesce(args.size_cm, y_qr.get("size_cm", 3.0)))
-    dpi = int(_coalesce(args.dpi, y_qr.get("dpi", args.dpi)))
-
-    missing = [k for k, v in {"given_name": given_name, "family_name": family_name}.items() if not v]
-    if missing:
-        fail("Missing required fields: " + ", ".join(missing))
-
-    try:
-        vcard = build_vcard(
-            given_name=given_name,
-            family_name=family_name,
-            additional_names=additional_names,
-            honorific_prefixes=honorific_prefixes,
-            honorific_suffixes=honorific_suffixes,
-            formatted_name=fn,
-            org=org,
-            title=title,
-            emails=emails,
-            tels=tels,
-            adr=adr,
-            url=url,
-            note=note,
-        )
-    except Exception as e:
-        fail(f"Failed to build vCard: {e}")
-
-    try:
-        if args.verbose:
-            print(f"Writing QR to: {out_path}", file=sys.stderr)
-        generate_qr_with_logo(
-            vcard,
-            logo,
-            out_path,
-            box_size=box_size,
-            border=border,
-            logo_scale=logo_scale,
-            badge_rounding=badge_rounding,
-            badge_padding_px=badge_padding,
-            size_px=int(size_px) if size_px is not None else None,
-            size_cm=float(size_cm),
-            dpi=int(dpi),
-        )
-        print(f"✅ QR code generated: {out_path}", file=sys.stderr)
-    except Exception as e:
-        fail(f"Failed to generate QR: {e}")
+        # Generate QR
+        try:
+            if True:  # keep for readability; could use a --verbose flag
+                print(f"Writing QR to: {out_path}", file=sys.stderr)
+            generate_qr_with_logo(
+                vcard,
+                logo,
+                out_path,
+                box_size=int(q.get("box_size", 12)),
+                border=int(q.get("border", 4)),
+                logo_scale=float(q.get("logo_scale", 0.22)),
+                badge_rounding=int(q.get("badge_rounding", 16)),
+                badge_padding_px=int(q.get("badge_padding", 12)),
+                size_px=int(q["size_px"]) if "size_px" in q and q["size_px"] is not None else None,
+                size_cm=float(q.get("size_cm", 3.0)),
+                dpi=int(q.get("dpi", 300)),
+            )
+            fn_disp = v_alias.get("FN") or f"{given_name} {family_name}"
+            print(f"✅ Generated QR for {fn_disp} → {out_path}", file=sys.stderr)
+        except Exception as e:
+            fail(f"Failed to generate QR for person {idx}: {e}")
 
 
 if __name__ == "__main__":
