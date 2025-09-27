@@ -1,0 +1,6 @@
+.idea/
+dist/
+examples/logo.png
+out/
+src/**/*.pyc
+
