@@ -19,5 +19,6 @@ vcard:
   note: "Let’s talk AI & MedTech"
 
 qr:
-  out_pattern: "out/{vcard.given_name}.{vcard.family_name}-{qr.size_px}px.png"
+  logo: logo.png
+  out_pattern: "../build/out/{vcard.given_name}.{vcard.family_name}-{qr.size_px}px.png"
   size_px: 512

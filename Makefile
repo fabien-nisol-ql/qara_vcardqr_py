@@ -9,6 +9,7 @@ help:
 	@echo "  venv        - create virtualenv"
 	@echo "  install     - install package (editable) + deps"
 	@echo "  run         - run example QR build"
+	@echo "  test     	 - generate the example and parse it"
 	@echo "  runyaml     - run example with YAML"
 	@echo "  build       - build wheel + sdist"
 	@echo "  clean       - remove build artifacts and venv"
@@ -41,12 +42,14 @@ run_example: install
 parse_example: run_example
 	$(VENV)/bin/vcardqr --parse out/John.Doe-512px.png
 
+test: run_example parse_example
+
 build: install
 	$(VENV)/bin/pip install --upgrade build
 	$(VENV)/bin/python -m build
 
 clean:
-	rm -rf $(VENV) dist build *.egg-info .pytest_cache .mypy_cache
+	rm -rf $(VENV) dist build *.egg-info .pytest_cache .mypy_cache build
 	find . -name '__pycache__' -type d -exec rm -rf {} +
 	@echo "Cleaned."
 

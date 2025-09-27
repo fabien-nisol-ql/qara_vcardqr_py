@@ -6,7 +6,11 @@ Generate **vCard 4.0 (RFC 6350)** QR codes with an optional **center logo badge*
 
 ```bash
 make install
-make runyaml
+❯ vcardqr --yaml examples/contact.yaml
+✅ QR code generated: /Users/fnisol/git/qara_vcardqr_py/out/John.Doe-512px.png
+```
+
+```bash
 ```
 
 ## YAML Input

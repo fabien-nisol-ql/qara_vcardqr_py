@@ -13,12 +13,15 @@ from .decode import decode_qr_from_file
 
 
 def parse_kv_pairs(pairs: list[str]) -> Dict[str, str]:
+    """
+    Parse KEY:VALUE pairs from CLI (e.g., --tel cell:"+41 ..." --adr street:"...").
+    """
     out: Dict[str, str] = {}
     for p in pairs or []:
         if ":" not in p:
             raise argparse.ArgumentTypeError(f"Expected KEY:VALUE, got '{p}'")
         k, v = p.split(":", 1)
-        out[k].strip() if (k := k.strip()) else k
+        k = k.strip()
         out[k] = v.strip()
     return out
 
@@ -123,6 +126,9 @@ _placeholder_rx = re.compile(r"\{([^{}]+)\}")
 
 
 def _render_pattern_with_yaml(pattern: str, yaml_root: Dict[str, Any], vcard_aliases: Dict[str, Any]) -> str:
+    """
+    Render out_pattern allowing dotted YAML paths and friendly/flat aliases.
+    """
     def repl(m: re.Match) -> str:
         key = m.group(1).strip()
         if "." in key:
@@ -142,7 +148,15 @@ def _resolve_output_path(
         out_pattern: Optional[str],
         vcard_ctx_flat: Dict[str, Any],
         yaml_root: Dict[str, Any],
+        base_dir: Optional[str],  # ← base directory (YAML dir) to resolve relative paths
 ) -> str:
+    """
+    Decide output path:
+      - If explicit_out is provided -> use it (resolve relative to base_dir if present).
+      - Else if out_pattern is provided -> render then resolve relative to base_dir.
+      - Else -> error.
+    Adds '.png' if no extension is present. Sanitizes only the basename.
+    """
     if explicit_out:
         path = explicit_out
     elif out_pattern:
@@ -154,6 +168,12 @@ def _resolve_output_path(
         path = os.path.join(dir_part or ".", base)
     else:
         fail("Missing output destination. Provide --out or --out-pattern, or set qr.out / qr.out_pattern in YAML.")
+
+    # Resolve relative paths against YAML directory if provided
+    if base_dir and not os.path.isabs(path) and not path.startswith("/dev/"):
+        path = os.path.normpath(os.path.join(base_dir, path))
+
+    # Ensure extension
     root, ext = os.path.splitext(path)
     if not ext:
         path = f"{path}.png"
@@ -212,21 +232,24 @@ def main() -> None:
     # -------------------------
     # PARSE MODE
     # -------------------------
+    # -------------------------
+    # PARSE MODE
+    # -------------------------
     if args.parse:
+        # UX: warn about heavy import
+        print("⏳ Loading OpenCV (first time can take a while)...", file=sys.stderr, flush=True)
         try:
+            from .decode import decode_qr_from_file  # lazy import
             payloads = decode_qr_from_file(args.parse)
         except FileNotFoundError:
             fail(f"Image not found: {args.parse}")
         except Exception as e:
             fail(f"Failed to decode QR from '{args.parse}': {e}")
         if not payloads:
-            # No stdout output; signal with non-zero exit to be script-friendly
             print("No QR codes found.", file=sys.stderr)
             sys.exit(3)
-        # Print payloads line-by-line to stdout (no extra logs)
         for p in payloads:
             print(p)
-        # Optional confirmation to stderr
         print(f"✅ Parsed {len(payloads)} QR payload(s) from {args.parse}", file=sys.stderr)
         return
 
@@ -236,8 +259,10 @@ def main() -> None:
 
     # Load YAML if provided
     y: Dict[str, Any] = {}
+    yaml_dir: Optional[str] = None
     if args.yaml_file:
         y = load_yaml(args.yaml_file)
+        yaml_dir = os.path.dirname(os.path.abspath(args.yaml_file))
 
     y_v: Dict[str, Any] = y.get("vcard") or {}
     y_qr: Dict[str, Any] = y.get("qr") or {}
@@ -290,16 +315,21 @@ def main() -> None:
         out_pattern=_coalesce(args.out_pattern, y_qr.get("out_pattern")),
         vcard_ctx_flat=vcard_aliases,
         yaml_root={"vcard": y_v, "qr": y_qr, **y},
+        base_dir=yaml_dir,  # ← resolve relative to YAML dir
     )
 
     out_dir = os.path.dirname(os.path.abspath(out_path))
     if out_dir and not args.no_create_dirs:
         os.makedirs(out_dir, exist_ok=True)
 
+    # Resolve logo: if relative and YAML provided, make it relative to YAML dir
     logo = _coalesce(args.logo, y_qr.get("logo"))
-    if logo and not os.path.isfile(logo):
-        print(f"Warning: logo file not found: {logo} — continuing without logo.", file=sys.stderr)
-        logo = None
+    if logo:
+        if yaml_dir and not os.path.isabs(logo):
+            logo = os.path.normpath(os.path.join(yaml_dir, logo))
+        if not os.path.isfile(logo):
+            print(f"Warning: logo file not found: {logo} — continuing without logo.", file=sys.stderr)
+            logo = None
 
     box_size = int(_coalesce(args.box_size, y_qr.get("box_size", 12)))
     border = int(_coalesce(args.border, y_qr.get("border", 4)))
