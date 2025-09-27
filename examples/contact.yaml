@@ -1,11 +1,11 @@
 vcard:
-  given_name: Fabien
-  family_name: Nisol
-  fn: Fabien Nisol
+  given_name: John
+  family_name: Doe
+  fn: John Doe
   org: QARALink SA
-  title: CTO
+  title: QRcode Manager
   emails:
-    - fabien.nisol@example.com
+    - jdoel@qaralink.com
   tels:
     cell: "+41 79 123 45 67"
     work: "+41 44 987 65 43"
@@ -19,10 +19,5 @@ vcard:
   note: "Let’s talk AI & MedTech"
 
 qr:
-  logo: examples/example_logo.png
-  out: business_card_vcard_qr_from_yaml.png
-  box_size: 12
-  border: 4
-  logo_scale: 0.22
-  badge_rounding: 16
-  badge_padding: 12
+  out_pattern: "out/{vcard.given_name}.{vcard.family_name}-{qr.size_px}px.png"
+  size_px: 512

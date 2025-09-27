@@ -15,7 +15,8 @@ authors = [
 dependencies = [
   "qrcode[pil]>=7.4",
   "Pillow>=10.0",
-  "PyYAML>=6.0.1"
+  "PyYAML>=6.0.1",
+  "opencv-python>=4.8"   # ← pure pip wheel, no system libs needed
 ]
 
 [project.scripts]
